@@ -6,7 +6,7 @@ POSE_MATRIX_X = 4
 POSE_MATRIX_Y = 4
 N_ROUTING_ITERS = 3
 #My interpretation of https://openreview.net/pdf?id=HJWLfGWRb
-LAMBDA = 1#tf.placeholder(tf.float32)
+LAMBDA = tf.placeholder(tf.float32)
 
 
 
@@ -37,9 +37,9 @@ class Capsule():
         self.matrix_dim_size = POSE_MATRIX_X * POSE_MATRIX_Y
         self.layer_name = name
 
-    def _init_em(self):
+    def _init_em(self, pev_layer):
         self.count = 0
-        self.n_i = self.kernel_size * self.kernel_size * self.n_output_capsules
+        self.n_i = self.kernel_size * self.kernel_size * pev_layer.n_output_capsules
         self.n_c = self.n_output_capsules
         self.R = tf.Variable(np.ones( (self.batch_size,self.n_i,self.n_c) ) / self.n_c )
         self.R = tf.to_float(self.R)
@@ -51,14 +51,13 @@ class Capsule():
     def __call__(self, previous_layer):
         if(previous_layer.type == 'capsule'):
             self.batch_size = int(previous_layer.activations.get_shape()[0])
-            self._init_em()
+            self._init_em(previous_layer)
             prev_shape = previous_layer.activations.get_shape()
             self.activations = self.route_em(previous_layer)
-            new_shape = (self.batch_size,prev_shape[1]//self.stride, prev_shape[2]//self.stride, self.n_output_capsules)
-            self.activations.set_shape( (new_shape) )
+            
         elif(previous_layer.type == 'conv'):
             self.batch_size = int(previous_layer.activations.get_shape()[0])
-            self._init_em()
+            self._init_em(previous_layer)
             #No routing necessary - regular convolution with 17 output channels time the number of output channels
             n_output_channels = self.n_output_capsules * self.matrix_dim_size
             self.output = tf.layers.conv2d(previous_layer.activations
@@ -70,9 +69,6 @@ class Capsule():
             tmp_pose = self.output[:,:,:,previous_layer.n_output_capsules:]
             tmp_activations = tf.nn.sigmoid(self.output[:,:,:,-previous_layer.n_output_capsules:])
             self.activations = self.primary_conv(tmp_activations,tmp_pose,self.route_patch, int(previous_layer.activations.get_shape()[-1]))
-            prev_shape = previous_layer.activations.get_shape()
-            new_shape = (self.batch_size,prev_shape[1]//self.stride, prev_shape[2]//self.stride, self.n_output_capsules)
-            self.activations.set_shape( new_shape )
         else:
             raise TypeError("Input must be either a tensor or capsule. Input type given : {}".format(type(previous_layer)))
         return self
@@ -81,22 +77,11 @@ class Capsule():
     def route_patch(self,activations, votes, m, r):
             n_dims = len(activations.get_shape())
             activations = tf.reshape(activations,[self.batch_size ,-1])
-            """
-            print("Activations are {}".format(activations))
-            print("votes are {}".format(votes))
-            print("m are {}".format(m))
-            print("r are {}".format(r))
-            """
             assert n_dims == 4, "Patch must be 4 dimenional but is {}".format(n_dims)
             for iteration in range(N_ROUTING_ITERS):
-                
-                m, s, activations = self.m_step(r, activations, votes, self.beta_v, self.beta_a)
-                
-                    
-                    
-
-                r = self.e_step(m,s, activations, votes, r)
-            return activations, m #M = pose
+                m, s, tmp_act = self.m_step(r, activations, votes, self.beta_v, self.beta_a)
+                r = self.e_step(m,s, tmp_act, votes, r)
+            return tmp_act, m #M = pose
 
     def route_em(self, previous_layer):
         self.activations = self.custom_conv(previous_layer, self.kernel_size, self.kernel_size, self.stride, self.stride, self.route_patch)
@@ -112,9 +97,10 @@ class Capsule():
         strides = [1, strides_rows, strides_cols, 1]
         rates = [1, 1, 1, 1]
         padding = 'VALID'
+        
+
         image_patches = tf.extract_image_patches(input_layer.activations, ksizes, strides, rates, padding)
         shape = [int(x) for x in image_patches.get_shape()]
-
         if(len(shape) == 4):
             prev_shape = input_layer.activations.get_shape()
             batch_size = int(prev_shape[0])
@@ -128,24 +114,26 @@ class Capsule():
         index = 0
         votes = tf.random_normal([batch_size, k_r*k_c*n_channels,self.n_output_capsules,16])
         for i in range(nr):
-            print("row {}/{}".format(i,nr))
+            #print("row {}/{}".format(i,nr))
             feature_map_patches_cols = []
             for j in range(nc):
-                print("col {}/{}".format(j,nc))
+                #print("col {}/{}".format(j,nc))
                 batch_patch = []
                 for b in range(batch_size):
                     patch = tf.expand_dims(tf.reshape(image_patches[b,i,j,], [kernel_size_rows, kernel_size_cols, n_channels]), 0)
                     batch_patch.append(patch)
                 self.M.append(tf.Variable(np.ones( (self.batch_size,self.n_c,16) )))
                 patch = tf.concat(batch_patch, axis = 0)
-                print("THE PATCH {}".format(patch))
                 
                 activations, self.M[index] = op(patch, votes, self.M[index], self.R)
                 
-                feature_map_patches_cols.append(activations)
+                feature_map_patches_cols.append(tf.reshape(activations, [self.batch_size, 1, 1,self.n_output_capsules ]))
                 index+=1
+            
             col = tf.concat(feature_map_patches_cols, axis = 2)
             feature_map_patches.append(col)
+        print("nr {}, nc {}".format(nr, nc))
+        print(feature_map_patches)
         return tf.concat(feature_map_patches, axis = 1)
 
 
@@ -159,6 +147,7 @@ class Capsule():
         strides = [1, strides_rows, strides_cols, 1]
         rates = [1, 1, 1, 1]
         padding = 'VALID'
+        
         activation_patches = tf.extract_image_patches(activations, ksizes, strides, rates, padding)
         pose_patches = tf.extract_image_patches(m, ksizes, strides, rates, padding)
         shape = [int(x) for x in activation_patches.get_shape()]
@@ -174,12 +163,12 @@ class Capsule():
 
         feature_map_patches = []
         index = 0
-        votes = tf.random_normal([batch_size, self.kernel_size*self.kernel_size*input_channels,self.n_output_capsules*16])
+        votes = tf.random_normal([batch_size, self.kernel_size*self.kernel_size*input_channels,self.n_output_capsules,16])
         for i in range(nr):
-            print("row {}/{}".format(i,nr))
+            #print("row {}/{}".format(i,nr))
             feature_map_patches_cols = []
             for j in range(nc):
-                print("col {}/{}".format(j,nc))
+                #print("col {}/{}".format(j,nc))
                 batch_patch_a, batch_patch_m = [], []
                 for b in range(batch_size):
                     patch_a = tf.expand_dims(tf.reshape(activation_patches[b,i,j,], [kernel_size_rows, kernel_size_cols, n_a_channels]), 0)
@@ -189,7 +178,8 @@ class Capsule():
                 patch_a = tf.concat(batch_patch_a, axis = 0)
                 patch_m = tf.concat(batch_patch_m, axis = 0)
                 activations, _ = op(patch_a, votes, patch_m, self.R)
-                feature_map_patches_cols.append(tf.reshape(activations,[self.batch_size, self.kernel_size, self.kernel_size,self.n_output_capsules]))
+                
+                feature_map_patches_cols.append(tf.reshape(activations,[self.batch_size, 1, 1,self.n_output_capsules]))
                 index+=1
             col = tf.concat(feature_map_patches_cols, axis = 2)
             feature_map_patches.append(col)     
@@ -201,15 +191,25 @@ class Capsule():
         #This should broadcast. R maintains its original shape
         #r shape = [batch(b),prev_layer(i),next_layer(c)]
         #a shape = [batch(a),prev_layer(i)] ===> expand dims makes this [batch(a), prev_layer(i), 1]
-        r = r * tf.expand_dims(a, -1)
+        try:
+            r = r * tf.expand_dims(a, -1)
+        except:
+            print(r)
+            print(a)
+            exit(0)
+        
+
         #denominator shape should be [batch(b), next_layer(c)]
         denominator = tf.expand_dims(tf.reduce_sum(r,axis = 1), -1) #<= so that it broadcasts for division
+        
+
         
         #mu should have shape [batch(b), next_layer(c), pose_matrix(h)]
         #Numerator is sum of product between r(i) and V(i)(h)
         #r shape = [batch(b), prev_layer(i),next_layer(c)]
         #v shape = [batch(b), prev_layer(i),next_layer(c), pose_matrix(h)]
 
+        
         numerator_mu = tf.reduce_sum(tf.expand_dims(r, -1) * V_prime, axis = 1)
         mu = numerator_mu/denominator
         #variance should have shape [batch(b), next_layer(c), pose_matrix(h)]
@@ -227,7 +227,7 @@ class Capsule():
         cost_h = (beta_v + tf.log(std)) * denominator
         #a_prime shape = [batch(b), next_layer(c)]
         a_prime = tf.nn.sigmoid(LAMBDA * (beta_a - tf.reduce_sum(cost_h, axis = 2)))
-        print(a_prime.get_shape())
+        
         return mu, std, a_prime
 
     def e_step(self, M, S, tmp_activations, votes,R):  #FOR i (prev layer) :
